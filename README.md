@@ -96,7 +96,26 @@ Scale-in (back down to 1 task) takes substantially longer than scale-out, by des
 
 ## GitOps Alternative (Phase 9)
 
-*(to be completed)*
+A parallel deployment path exists on the `gitops` branch, using GitHub Actions instead of Jenkins. Both branches are intentionally kept separate rather than merged — `main` demonstrates the Jenkins-based CI/CD pipeline (Phase 5), while `gitops` demonstrates a GitHub-native alternative achieving the same result. They could technically be merged, since the two workflows don't conflict, but keeping them parallel makes each approach independently reviewable on its own branch.
+
+### Setup
+
+1. **OIDC provider** (one-time, account-level): IAM → Identity providers → added `token.actions.githubusercontent.com` as an OpenID Connect provider, with audience `sts.amazonaws.com`. This lets AWS trust identity tokens issued by GitHub Actions, without either side storing a long-lived credential.
+2. **IAM role** (`github-actions-tc1-p4-deploy`): configured with a Web Identity trust policy scoped to this specific repo and the `gitops` branch only — a workflow run from `main`, a pull request, or a fork cannot assume this role. Permissions attached: `tc1-p4-deploy-policy`, the same least-privilege ECR/ECS policy shared with the Jenkins deploy user (see Phase 4), rather than the broader AWS-managed policies the base documentation suggested.
+3. **Workflow file** (`.github/workflows/deploy.yml`): triggers on push to `gitops`, requests a short-lived OIDC token (`permissions: id-token: write`), exchanges it for temporary AWS credentials via `aws-actions/configure-aws-credentials@v3`, then builds, tags, and pushes both Docker images to ECR and forces a new ECS deployment — functionally equivalent to the Jenkinsfile's stages, but using GitHub-native building blocks instead of Jenkins plugins and a self-hosted server.
+
+### Troubleshooting: `Not authorized to perform sts:AssumeRoleWithWebIdentity`
+
+The workflow failed with this error on every attempt, despite every static configuration check (trust policy JSON, OIDC provider ARN, IAM role ARN, workflow YAML) coming back correct via direct AWS CLI verification. Root-caused in two stages:
+
+1. **First finding**: debug logging on the `configure-aws-credentials` step showed `"7 role session tags are being used"` immediately before each failure. The trust policy only granted `sts:AssumeRoleWithWebIdentity`, not the separate `sts:TagSession` permission this action uses by default to tag the session with repo/workflow metadata. Fixed by adding an `sts:TagSession` statement to the trust policy — necessary, but not sufficient; the same error persisted afterward.
+2. **Actual root cause**: pulled the real denial reason from CloudTrail (`aws cloudtrail lookup-events`) rather than continuing to trust the SDK's generic error message. The logged `principalId` showed the token's `sub` claim as `repo:calebyoda@211935272/devops-tech-challenge1@1362212146:ref:refs/heads/gitops` — GitHub now embeds immutable numeric org/repo IDs alongside the human-readable names in OIDC tokens (a security hardening measure preventing trust-policy hijacking via account/repo renames). The trust policy's `StringLike` condition was written against the older, ID-less format (`repo:calebyoda/devops-tech-challenge1:...`), which never matches the current token format. Fixed by adding wildcards: `repo:calebyoda*/devops-tech-challenge1*:ref:refs/heads/gitops`.
+
+This is a good example of an error message being technically accurate but practically misleading — the fix that mattered was invisible until cross-referencing CloudTrail's actual audit log against the token's real claims, rather than iterating on the IAM console configuration alone.
+
+### Verification
+
+Confirmed via `aws ecs describe-services` that both services reached `"rolloutState": "COMPLETED"` on the `PRIMARY` deployment following the GitOps pipeline run, with `runningCount` matching `desiredCount` on both — the images this workflow built and pushed were genuinely deployed and healthy, not just reported as such by the pipeline's own logs.
 
 ## Submission
 
